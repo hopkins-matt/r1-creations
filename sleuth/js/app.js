@@ -165,9 +165,12 @@ function captureFrame() {
 // ═══════════════════════════════════════════
 
 function sendToLLM(imageBase64, prompt) {
+  dbg('sendToLLM called, PMH=' + (typeof PluginMessageHandler));
+  dbg('imageBase64 len=' + (imageBase64 ? imageBase64.length : 0));
+
   if (typeof PluginMessageHandler === 'undefined') {
     // Dev mode — simulate a response after a short delay
-    console.log('[sleuth] PluginMessageHandler not available — dev mode');
+    dbg('dev mode — sending mock response');
     setTimeout(() => {
       const mock = state === STATES.HD_ANALYZING
         ? '{"result":"NOT HOT DOG","reason":"This is a keyboard. Not a hot dog."}'
@@ -177,20 +180,32 @@ function sendToLLM(imageBase64, prompt) {
     return;
   }
 
-  PluginMessageHandler.postMessage(JSON.stringify({
+  var payload = {
     message:        prompt,
     useLLM:         true,
     imageBase64:    imageBase64,
     wantsR1Response: settings.voice,
-  }));
+  };
+  dbg('posting to PMH, msg len=' + prompt.length);
+  try {
+    PluginMessageHandler.postMessage(JSON.stringify(payload));
+    dbg('postMessage sent OK');
+  } catch (e) {
+    dbg('postMessage error: ' + e.message);
+  }
 }
 
 window.onPluginMessage = function(data) {
+  dbg('onPluginMessage fired, type=' + typeof data);
+  dbg('data keys=' + (data ? Object.keys(data).join(',') : 'null'));
+  dbg('data.data=' + (data && data.data ? data.data.substring(0, 120) : 'empty'));
+  dbg('data.message=' + (data && data.message ? String(data.message).substring(0, 120) : 'empty'));
   handleLLMResponse(data);
 };
 
 function handleLLMResponse(data) {
   const raw     = (data && (data.data || data.message)) || '';
+  dbg('raw response len=' + raw.length);
   const cleaned = raw
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
