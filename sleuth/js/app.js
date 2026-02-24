@@ -77,21 +77,35 @@ document.addEventListener('DOMContentLoaded', async () => {
   bindHardwareEvents();
   startCamera();
   addErrorToast();
+
+  // R1 WebView may block autoplay — retry video.play() on first user interaction
+  function resumeVideo() {
+    if (video.paused && video.srcObject) {
+      dbg('resuming video on user gesture');
+      video.play().catch(function() {});
+    }
+    document.removeEventListener('touchstart', resumeVideo);
+    document.removeEventListener('click', resumeVideo);
+    window.removeEventListener('sideClick', resumeVideo);
+  }
+  document.addEventListener('touchstart', resumeVideo);
+  document.addEventListener('click', resumeVideo);
+  window.addEventListener('sideClick', resumeVideo);
 });
 
 // ═══════════════════════════════════════════
 // CAMERA
 // ═══════════════════════════════════════════
 
-async function startCamera() {
-  function dbg(msg) {
-    console.log('[sleuth] ' + msg);
-    // Temporary on-screen debug — remove before release
-    var d = document.getElementById('dbg');
-    if (!d) { d = document.createElement('div'); d.id = 'dbg'; d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#000;color:#0f0;font:9px monospace;padding:4px;z-index:9999;max-height:80px;overflow-y:auto;'; document.body.appendChild(d); }
-    d.textContent += msg + '\n';
-  }
+function dbg(msg) {
+  console.log('[sleuth] ' + msg);
+  // Temporary on-screen debug — remove before release
+  var d = document.getElementById('dbg');
+  if (!d) { d = document.createElement('div'); d.id = 'dbg'; d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#000;color:#0f0;font:9px monospace;padding:4px;z-index:9999;max-height:80px;overflow-y:auto;'; document.body.appendChild(d); }
+  d.textContent += msg + '\n';
+}
 
+async function startCamera() {
   async function attachStream(stream) {
     dbg('stream obtained, tracks: ' + stream.getVideoTracks().length);
     video.srcObject = stream;
