@@ -318,7 +318,25 @@ function doCapture() {
     return;
   }
 
-  sendToLLM(imageBase64, isHotdog ? PROMPT_HOTDOG : PROMPT_STANDARD);
+  // DIAGNOSTIC: first send a text-only LLM request to test callback
+  dbg('TEST: sending text-only LLM request first...');
+  window.onPluginMessage = _onPluginMsg;
+  try {
+    PluginMessageHandler.postMessage(JSON.stringify({
+      message: 'Respond with only this exact JSON: {"test":"ok"}',
+      useLLM: true,
+      wantsR1Response: false,
+      wantsJournalEntry: false,
+    }));
+    dbg('TEST: text-only sent, waiting 8s...');
+  } catch(e) { dbg('TEST error: ' + e.message); }
+
+  // After 8s, send the real image request regardless
+  setTimeout(function() {
+    dbg('sending REAL image request now');
+    window.onPluginMessage = _onPluginMsg;
+    sendToLLM(imageBase64, isHotdog ? PROMPT_HOTDOG : PROMPT_STANDARD);
+  }, 8000);
 }
 
 // ═══════════════════════════════════════════
