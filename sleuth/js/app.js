@@ -201,7 +201,7 @@ function sendToLLM(imageBase64, prompt) {
     message:        prompt,
     useLLM:         true,
     imageBase64:    imageBase64,
-    wantsR1Response: false,
+    wantsR1Response: true,
     wantsJournalEntry: false,
   };
   dbg('posting to PMH, msg len=' + prompt.length + ', img len=' + (imageBase64 ? imageBase64.length : 0));
