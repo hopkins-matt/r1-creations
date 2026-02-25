@@ -199,6 +199,7 @@ function sendToLLM(imageBase64, prompt) {
     useLLM:         true,
     imageBase64:    imageBase64,
     wantsR1Response: settings.voice,
+    wantsJournalEntry: false,
   };
   dbg('posting to PMH, msg len=' + prompt.length);
   try {
@@ -209,13 +210,29 @@ function sendToLLM(imageBase64, prompt) {
   }
 }
 
-window.onPluginMessage = function(data) {
-  dbg('onPluginMessage fired, type=' + typeof data);
-  dbg('data keys=' + (data ? Object.keys(data).join(',') : 'null'));
-  dbg('data.data=' + (data && data.data ? data.data.substring(0, 120) : 'empty'));
-  dbg('data.message=' + (data && data.message ? String(data.message).substring(0, 120) : 'empty'));
-  handleLLMResponse(data);
-};
+// Register callback — try both assignment styles the R1 might expect
+function _onPluginMsg(data) {
+  try {
+    dbg('onPluginMessage fired, type=' + typeof data);
+    if (typeof data === 'string') {
+      dbg('data is string, len=' + data.length + ': ' + data.substring(0, 150));
+      handleLLMResponse({ data: data });
+      return;
+    }
+    dbg('data keys=' + (data ? Object.keys(data).join(',') : 'null'));
+    dbg('data.data=' + (data && data.data ? String(data.data).substring(0, 150) : 'empty'));
+    dbg('data.message=' + (data && data.message ? String(data.message).substring(0, 150) : 'empty'));
+    handleLLMResponse(data);
+  } catch (e) {
+    dbg('onPluginMessage ERROR: ' + e.message);
+  }
+}
+window.onPluginMessage = _onPluginMsg;
+// Also try addEventListener in case R1 dispatches a custom event
+window.addEventListener('pluginMessage', function(e) {
+  dbg('pluginMessage EVENT fired');
+  _onPluginMsg(e.detail || e.data || e);
+});
 
 function handleLLMResponse(data) {
   const raw     = (data && (data.data || data.message)) || '';
