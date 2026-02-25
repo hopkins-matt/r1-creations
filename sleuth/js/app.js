@@ -228,11 +228,33 @@ function _onPluginMsg(data) {
   }
 }
 window.onPluginMessage = _onPluginMsg;
-// Also try addEventListener in case R1 dispatches a custom event
+
+// Shotgun approach — try every possible way the R1 might return data
+// 1. Standard postMessage (Flutter WebView commonly uses this)
+window.addEventListener('message', function(e) {
+  dbg('window.message event: ' + typeof e.data + ' ' + String(e.data).substring(0, 150));
+  if (e.data && typeof e.data === 'string') {
+    try { var parsed = JSON.parse(e.data); _onPluginMsg(parsed); } catch(ex) { _onPluginMsg({ data: e.data }); }
+  } else if (e.data) {
+    _onPluginMsg(e.data);
+  }
+});
+// 2. Custom event
 window.addEventListener('pluginMessage', function(e) {
   dbg('pluginMessage EVENT fired');
   _onPluginMsg(e.detail || e.data || e);
 });
+// 3. Probe the bridge object for clues
+try {
+  var pmhKeys = [];
+  for (var k in PluginMessageHandler) { pmhKeys.push(k); }
+  dbg('PMH keys: ' + (pmhKeys.length ? pmhKeys.join(',') : 'none'));
+  dbg('PMH type: ' + typeof PluginMessageHandler);
+  dbg('PMH proto: ' + Object.getPrototypeOf(PluginMessageHandler));
+} catch(e) { dbg('PMH probe: ' + e.message); }
+// 4. Monitor if onPluginMessage gets overwritten
+var _origDesc = Object.getOwnPropertyDescriptor(window, 'onPluginMessage');
+dbg('onPluginMessage defined: ' + (typeof window.onPluginMessage) + ', configurable: ' + (_origDesc ? _origDesc.configurable : 'N/A'));
 
 function handleLLMResponse(data) {
   const raw     = (data && (data.data || data.message)) || '';
