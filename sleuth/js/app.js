@@ -197,12 +197,11 @@ function sendToLLM(imageBase64, prompt) {
   // Re-assign callback right before send (Launch Pad R1 pattern)
   window.onPluginMessage = _onPluginMsg;
 
+  // Use pluginId approach (Magic Kam pattern) — proven to callback
   var payload = {
     message:        prompt,
-    useLLM:         true,
+    pluginId:       'com.r1.pixelart',
     imageBase64:    imageBase64,
-    wantsR1Response: true,
-    wantsJournalEntry: false,
   };
   dbg('posting to PMH, msg len=' + prompt.length + ', img len=' + (imageBase64 ? imageBase64.length : 0));
   try {
@@ -318,25 +317,7 @@ function doCapture() {
     return;
   }
 
-  // DIAGNOSTIC: first send a text-only LLM request to test callback
-  dbg('TEST: sending text-only LLM request first...');
-  window.onPluginMessage = _onPluginMsg;
-  try {
-    PluginMessageHandler.postMessage(JSON.stringify({
-      message: 'Respond with only this exact JSON: {"test":"ok"}',
-      useLLM: true,
-      wantsR1Response: false,
-      wantsJournalEntry: false,
-    }));
-    dbg('TEST: text-only sent, waiting 8s...');
-  } catch(e) { dbg('TEST error: ' + e.message); }
-
-  // After 8s, send the real image request regardless
-  setTimeout(function() {
-    dbg('sending REAL image request now');
-    window.onPluginMessage = _onPluginMsg;
-    sendToLLM(imageBase64, isHotdog ? PROMPT_HOTDOG : PROMPT_STANDARD);
-  }, 8000);
+  sendToLLM(imageBase64, isHotdog ? PROMPT_HOTDOG : PROMPT_STANDARD);
 }
 
 // ═══════════════════════════════════════════
