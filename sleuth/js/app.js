@@ -194,20 +194,32 @@ function sendToLLM(imageBase64, prompt) {
     return;
   }
 
+  // Re-assign callback right before send (Launch Pad R1 pattern)
+  window.onPluginMessage = _onPluginMsg;
+
   var payload = {
     message:        prompt,
     useLLM:         true,
     imageBase64:    imageBase64,
-    wantsR1Response: settings.voice,
+    wantsR1Response: false,
     wantsJournalEntry: false,
   };
-  dbg('posting to PMH, msg len=' + prompt.length);
+  dbg('posting to PMH, msg len=' + prompt.length + ', img len=' + (imageBase64 ? imageBase64.length : 0));
   try {
     PluginMessageHandler.postMessage(JSON.stringify(payload));
-    dbg('postMessage sent OK');
+    dbg('postMessage sent OK — waiting for onPluginMessage...');
   } catch (e) {
     dbg('postMessage error: ' + e.message);
   }
+
+  // Watchdog: if no response in 15s, log state
+  setTimeout(function() {
+    if (state === STATES.ANALYZING || state === STATES.HD_ANALYZING) {
+      dbg('WATCHDOG: no response after 15s');
+      dbg('onPluginMessage is: ' + typeof window.onPluginMessage);
+      dbg('onPluginMessage === _onPluginMsg: ' + (window.onPluginMessage === _onPluginMsg));
+    }
+  }, 15000);
 }
 
 // Register callback — try both assignment styles the R1 might expect
