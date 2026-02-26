@@ -42,6 +42,17 @@ const settings = {
   hotdog: false,
 };
 
+function detectPluginIdFromUrl() {
+  try {
+    const u = new URL(window.location.href);
+    return u.searchParams.get('pluginId') || u.searchParams.get('plugin_id') || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+const detectedPluginId = detectPluginIdFromUrl();
+
 // ═══════════════════════════════════════════
 // PROMPTS
 // ═══════════════════════════════════════════
@@ -263,8 +274,8 @@ function sendToLLM(imageBase64, prompt) {
     return;
   }
 
-  // Re-assign callback right before send (Launch Pad R1 pattern)
-  window.onPluginMessage = _onPluginMsg;
+  // Re-assign callbacks right before send (some hosts overwrite handlers).
+  registerMessageBridges();
 
   // Official SDK flags:
   // - useLLM: request LLM inference
@@ -272,15 +283,16 @@ function sendToLLM(imageBase64, prompt) {
   var payload = {
     message:           prompt,
     useLLM:            true,
-    // Force silent while debugging response rendering reliability.
     wantsR1Response:   false,
     wantsJournalEntry: false,
   };
   if (imageBase64) payload.imageBase64 = imageBase64;
+  if (detectedPluginId) payload.pluginId = detectedPluginId;
   dbgJson('request/payload-meta', {
     id: activeRequest ? activeRequest.id : null,
     promptLen: prompt.length,
     imageLen: imageBase64 ? imageBase64.length : 0,
+    pluginId: payload.pluginId || '(none)',
     useLLM: payload.useLLM,
     wantsR1Response: payload.wantsR1Response,
     voiceToggle: settings.voice,
@@ -319,13 +331,38 @@ function _onPluginMsg(data) {
       dbg('data keys=' + (data ? Object.keys(data).join(',') : 'null'));
       dbg('data.data=' + (data && data.data ? String(data.data).substring(0, 150) : 'empty'));
       dbg('data.message=' + (data && data.message ? String(data.message).substring(0, 150) : 'empty'));
+      if (data && data.parsedData) dbgJson('data.parsedData', data.parsedData);
+      else dbg('data.parsedData=empty');
     }
     handleLLMResponse(data);
   } catch (e) {
     dbg('onPluginMessage ERROR: ' + e.message);
   }
 }
-window.onPluginMessage = _onPluginMsg;
+
+function registerMessageBridges() {
+  // Base SDK callback
+  window.onPluginMessage = _onPluginMsg;
+  // Compatibility aliases used by wrappers/community SDKs.
+  window.onPluginResponse = _onPluginMsg;
+  window.onR1Message = _onPluginMsg;
+  window.onR1PluginMessage = _onPluginMsg;
+
+  try {
+    if (typeof PluginMessageHandler !== 'undefined') {
+      if (typeof PluginMessageHandler.setOnMessage === 'function') {
+        PluginMessageHandler.setOnMessage(_onPluginMsg);
+      }
+      if ('onmessage' in PluginMessageHandler) {
+        PluginMessageHandler.onmessage = _onPluginMsg;
+      }
+    }
+  } catch (e) {
+    dbg('bridge registration error: ' + e.message);
+  }
+}
+
+registerMessageBridges();
 
 // Shotgun approach — try every possible way the R1 might return data
 // 1. Standard postMessage (Flutter WebView commonly uses this)
@@ -340,6 +377,14 @@ window.addEventListener('message', function(e) {
 // 2. Custom event
 window.addEventListener('pluginMessage', function(e) {
   dbg('pluginMessage EVENT fired');
+  _onPluginMsg(e.detail || e.data || e);
+});
+window.addEventListener('r1Message', function(e) {
+  dbg('r1Message EVENT fired');
+  _onPluginMsg(e.detail || e.data || e);
+});
+document.addEventListener('pluginMessage', function(e) {
+  dbg('document.pluginMessage EVENT fired');
   _onPluginMsg(e.detail || e.data || e);
 });
 // 3. Probe the bridge object for clues
@@ -446,7 +491,7 @@ function extractResultPayload(value, depth) {
   if (typeof value !== 'object') return null;
   if (isResultPayload(value)) return value;
 
-  const wrapperKeys = ['data', 'message', 'response', 'payload', 'result', 'output', 'content', 'text'];
+  const wrapperKeys = ['data', 'parsedData', 'message', 'response', 'payload', 'result', 'output', 'output_text', 'content', 'text', 'llmResponse', 'assistant'];
   for (const key of wrapperKeys) {
     if (Object.prototype.hasOwnProperty.call(value, key)) {
       const nested = extractResultPayload(value[key], depth + 1);
@@ -462,7 +507,7 @@ function normalizeStandardPayload(value) {
 
   const name = value.name || value.object || value.item || value.title || '';
   const category = value.category || value.type || '';
-  const description = value.description || value.summary || value.details || value.reason || '';
+  const description = value.description || value.summary || value.details || value.reason || (typeof value.result === 'string' ? value.result : '');
   const fact = value.fun_fact || value.fact || value.trivia || '';
 
   if (name || category || description || fact) {
@@ -516,9 +561,14 @@ function handleLLMResponse(data) {
     dbg('late response received for activeRequest=' + activeRequest.id + ' while state=' + state);
   }
 
-  let parsed = extractResultPayload(data, 0);
-  const fallbackText = extractPlainText(data, 0);
-  let parseSource = parsed ? 'structured' : 'none';
+  const parsedData = (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'parsedData'))
+    ? data.parsedData
+    : null;
+  let parsed = parsedData != null ? extractResultPayload(parsedData, 0) : extractResultPayload(data, 0);
+  const fallbackText = extractPlainText(parsedData != null ? parsedData : data, 0) || extractPlainText(data, 0);
+  let parseSource = parsed
+    ? (parsedData != null ? 'parsedData-structured' : 'structured')
+    : 'none';
   const isHotdogFlow = state === STATES.HD_ANALYZING || (activeRequest && activeRequest.mode === 'hotdog');
 
   if (!parsed && isHotdogFlow) {
@@ -576,7 +626,14 @@ function handleLLMResponse(data) {
     return;
   }
 
-  if (isHotdogFlow || typeof parsed.result === 'string') {
+  if (isHotdogFlow) {
+    if (typeof parsed.result !== 'string') {
+      const maybeText = getAnyTextFallback(data, fallbackText);
+      parsed = {
+        result: (String(maybeText).toUpperCase().includes('NOT HOT DOG') ? 'NOT HOT DOG' : 'HOT DOG'),
+        reason: maybeText || 'Unable to classify.',
+      };
+    }
     endRequest('success', { ui: 'hotdog-result' });
     showHotdogResult(parsed);
   } else {
@@ -739,12 +796,6 @@ function onSideClick() {
     case STATES.CAMERA:
     case STATES.HD_CAMERA:
       doCapture();
-      break;
-
-    case STATES.ANALYZING:
-    case STATES.HD_ANALYZING:
-      endRequest('cancelled', { by: 'sideClick' });
-      setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
       break;
 
     case STATES.RESULT:
