@@ -53,6 +53,59 @@ function detectPluginIdFromUrl() {
 
 const detectedPluginId = detectPluginIdFromUrl();
 
+class R1CreateMessagingClient {
+  constructor() {
+    this.messageHandlers = new Set();
+    this.isInitialized = false;
+    this.initializeMessageHandler();
+  }
+
+  initializeMessageHandler() {
+    if (this.isInitialized) return;
+
+    // Mirrors r1-create's core behavior.
+    window.onPluginMessage = (data) => {
+      let parsedData;
+      if (data && Object.prototype.hasOwnProperty.call(data, 'data')) {
+        try {
+          parsedData = JSON.parse(data.data);
+        } catch (e) {
+          parsedData = data.data;
+        }
+      }
+
+      const enhancedData = Object.assign({}, data || {}, { parsedData: parsedData });
+      this.messageHandlers.forEach((handler) => {
+        try {
+          handler(enhancedData);
+        } catch (err) {
+          console.error('Error in message handler:', err);
+        }
+      });
+    };
+
+    this.isInitialized = true;
+  }
+
+  onMessage(handler) {
+    this.messageHandlers.add(handler);
+  }
+
+  sendMessage(message, options) {
+    if (typeof PluginMessageHandler === 'undefined') {
+      throw new Error('PluginMessageHandler not available');
+    }
+    const payload = Object.assign({ message: message }, options || {});
+    PluginMessageHandler.postMessage(JSON.stringify(payload));
+  }
+
+  askLLM(message, options) {
+    this.sendMessage(message, Object.assign({ useLLM: true }, options || {}));
+  }
+}
+
+let r1MessagingClient = null;
+
 // ═══════════════════════════════════════════
 // PROMPTS
 // ═══════════════════════════════════════════
@@ -274,8 +327,8 @@ function sendToLLM(imageBase64, prompt) {
     return;
   }
 
-  // Re-assign callbacks right before send (some hosts overwrite handlers).
-  registerMessageBridges();
+  // Ensure r1-create compatible bridge is bound before each send.
+  ensureR1MessagingClient();
 
   // Official SDK flags:
   // - useLLM: request LLM inference
@@ -299,7 +352,12 @@ function sendToLLM(imageBase64, prompt) {
     wantsJournalEntry: payload.wantsJournalEntry,
   });
   try {
-    PluginMessageHandler.postMessage(JSON.stringify(payload));
+    r1MessagingClient.askLLM(prompt, {
+      wantsR1Response: payload.wantsR1Response,
+      wantsJournalEntry: payload.wantsJournalEntry,
+      pluginId: payload.pluginId,
+      imageBase64: payload.imageBase64,
+    });
     dbg('postMessage sent OK — waiting for onPluginMessage...');
   } catch (e) {
     dbg('postMessage error: ' + e.message);
@@ -340,29 +398,18 @@ function _onPluginMsg(data) {
   }
 }
 
-function registerMessageBridges() {
-  // Base SDK callback
-  window.onPluginMessage = _onPluginMsg;
-  // Compatibility aliases used by wrappers/community SDKs.
-  window.onPluginResponse = _onPluginMsg;
-  window.onR1Message = _onPluginMsg;
-  window.onR1PluginMessage = _onPluginMsg;
-
-  try {
-    if (typeof PluginMessageHandler !== 'undefined') {
-      if (typeof PluginMessageHandler.setOnMessage === 'function') {
-        PluginMessageHandler.setOnMessage(_onPluginMsg);
-      }
-      if ('onmessage' in PluginMessageHandler) {
-        PluginMessageHandler.onmessage = _onPluginMsg;
-      }
-    }
-  } catch (e) {
-    dbg('bridge registration error: ' + e.message);
+function ensureR1MessagingClient() {
+  if (!r1MessagingClient) {
+    r1MessagingClient = new R1CreateMessagingClient();
+    r1MessagingClient.onMessage(_onPluginMsg);
+    // Alias hooks used by some wrappers/hosts.
+    window.onPluginResponse = window.onPluginMessage;
+    window.onR1Message = window.onPluginMessage;
+    window.onR1PluginMessage = window.onPluginMessage;
   }
 }
 
-registerMessageBridges();
+ensureR1MessagingClient();
 
 // Shotgun approach — try every possible way the R1 might return data
 // 1. Standard postMessage (Flutter WebView commonly uses this)
