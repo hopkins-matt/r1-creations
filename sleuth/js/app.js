@@ -147,13 +147,15 @@ function beginRequest(prompt, imageBase64) {
     startedAt: Date.now(),
     promptLen: prompt ? prompt.length : 0,
     imageLen: imageBase64 ? imageBase64.length : 0,
-    wantsR1Response: !!settings.voice,
+    voiceToggle: !!settings.voice,
+    wantsR1Response: false,
   };
   dbgJson('request/start', {
     id: activeRequest.id,
     mode: activeRequest.mode,
     promptLen: activeRequest.promptLen,
     imageLen: activeRequest.imageLen,
+    voiceToggle: activeRequest.voiceToggle,
     wantsR1Response: activeRequest.wantsR1Response,
   });
   return activeRequest.id;
@@ -270,7 +272,8 @@ function sendToLLM(imageBase64, prompt) {
   var payload = {
     message:           prompt,
     useLLM:            true,
-    wantsR1Response:   !!settings.voice,
+    // Force silent while debugging response rendering reliability.
+    wantsR1Response:   false,
     wantsJournalEntry: false,
   };
   if (imageBase64) payload.imageBase64 = imageBase64;
@@ -280,6 +283,7 @@ function sendToLLM(imageBase64, prompt) {
     imageLen: imageBase64 ? imageBase64.length : 0,
     useLLM: payload.useLLM,
     wantsR1Response: payload.wantsR1Response,
+    voiceToggle: settings.voice,
     wantsJournalEntry: payload.wantsJournalEntry,
   });
   try {
@@ -299,10 +303,8 @@ function sendToLLM(imageBase64, prompt) {
       dbg('WATCHDOG: no response after ' + RESPONSE_TIMEOUT_MS + 'ms');
       dbg('onPluginMessage is: ' + typeof window.onPluginMessage);
       dbg('onPluginMessage === _onPluginMsg: ' + (window.onPluginMessage === _onPluginMsg));
-      endRequest('timeout', { timeoutMs: RESPONSE_TIMEOUT_MS });
       dbgSnapshot('timeout');
-      showError('No response yet — try again');
-      setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
+      showError('Still waiting for response…');
     }
   }, RESPONSE_TIMEOUT_MS);
 }
@@ -396,18 +398,31 @@ function isResultPayload(value) {
 
 function extractPlainText(value, depth) {
   if (depth > 5 || value == null) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = extractPlainText(item, depth + 1);
+      if (nested) return nested;
+    }
+    return '';
+  }
   if (typeof value === 'string') return value.trim();
   if (typeof value !== 'object') return '';
 
-  const keys = ['data', 'message', 'response', 'output', 'content', 'text'];
+  const keys = ['data', 'message', 'response', 'output', 'content', 'text', 'output_text', 'assistant', 'answer', 'reply', 'transcript'];
   for (const key of keys) {
     if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
   }
   for (const key of keys) {
-    if (value[key] && typeof value[key] === 'object') {
+    if (value[key] != null && typeof value[key] === 'object') {
       const nested = extractPlainText(value[key], depth + 1);
       if (nested) return nested;
     }
+  }
+
+  // Generic object walk fallback for unknown schemas.
+  for (const key of Object.keys(value)) {
+    const nested = extractPlainText(value[key], depth + 1);
+    if (nested) return nested;
   }
   return '';
 }
@@ -478,18 +493,35 @@ function buildFallbackStandardPayload(rawText) {
   };
 }
 
+function getAnyTextFallback(data, preferred) {
+  if (preferred && preferred.trim()) return preferred.trim();
+  if (typeof data === 'string' && data.trim()) return data.trim();
+  try {
+    const compact = JSON.stringify(data);
+    if (compact && compact !== '{}' && compact !== '[]') return compact;
+  } catch (e) {
+    // ignore
+  }
+  return '';
+}
+
 function handleLLMResponse(data) {
-  // Only process responses while actively waiting on the LLM.
-  if (state !== STATES.ANALYZING && state !== STATES.HD_ANALYZING) {
-    dbg('ignoring plugin message while state=' + state + ', activeRequest=' + (activeRequest ? activeRequest.id : 'none'));
+  // Process late responses if we still have an active request.
+  const waitingForResponse = (state === STATES.ANALYZING || state === STATES.HD_ANALYZING);
+  if (!waitingForResponse && !activeRequest) {
+    dbg('ignoring plugin message while idle; state=' + state);
     return;
+  }
+  if (!waitingForResponse && activeRequest) {
+    dbg('late response received for activeRequest=' + activeRequest.id + ' while state=' + state);
   }
 
   let parsed = extractResultPayload(data, 0);
   const fallbackText = extractPlainText(data, 0);
   let parseSource = parsed ? 'structured' : 'none';
+  const isHotdogFlow = state === STATES.HD_ANALYZING || (activeRequest && activeRequest.mode === 'hotdog');
 
-  if (!parsed && state === STATES.HD_ANALYZING) {
+  if (!parsed && isHotdogFlow) {
     const upper = fallbackText.toUpperCase();
     if (upper.includes('HOT DOG')) {
       parsed = {
@@ -499,26 +531,37 @@ function handleLLMResponse(data) {
       parseSource = 'hotdog-text-fallback';
     }
   }
-  if (!parsed && state === STATES.ANALYZING) {
-    parsed = buildFallbackStandardPayload(fallbackText);
+  if (!parsed && !isHotdogFlow) {
+    parsed = buildFallbackStandardPayload(getAnyTextFallback(data, fallbackText));
     if (parsed) parseSource = 'standard-text-fallback';
   }
 
   if (!parsed) {
-    dbgJson('response/ignored', {
-      reason: 'no-parseable-payload',
-      fallbackTextLen: fallbackText.length,
-      activeRequestId: activeRequest ? activeRequest.id : null,
-    });
-    return;
+    const emergencyText = getAnyTextFallback(data, fallbackText);
+    if (!isHotdogFlow && emergencyText) {
+      parsed = {
+        name: 'Unknown',
+        category: '',
+        description: emergencyText,
+        fun_fact: '',
+      };
+      parseSource = 'emergency-stringify-fallback';
+    } else {
+      dbgJson('response/ignored', {
+        reason: 'no-parseable-payload',
+        fallbackTextLen: fallbackText.length,
+        activeRequestId: activeRequest ? activeRequest.id : null,
+      });
+      return;
+    }
   }
 
   clearTimeout(llmTimer);
   llmTimer = null;
 
   // Coerce standard payloads to the fields the UI expects.
-  if (state === STATES.ANALYZING && typeof parsed.result !== 'string') {
-    parsed = normalizeStandardPayload(parsed) || buildFallbackStandardPayload(fallbackText);
+  if (!isHotdogFlow && typeof parsed.result !== 'string') {
+    parsed = normalizeStandardPayload(parsed) || buildFallbackStandardPayload(getAnyTextFallback(data, fallbackText));
   }
 
   dbgJson('response/parsed', {
@@ -533,7 +576,7 @@ function handleLLMResponse(data) {
     return;
   }
 
-  if (state === STATES.HD_ANALYZING || typeof parsed.result === 'string') {
+  if (isHotdogFlow || typeof parsed.result === 'string') {
     endRequest('success', { ui: 'hotdog-result' });
     showHotdogResult(parsed);
   } else {
@@ -696,6 +739,12 @@ function onSideClick() {
     case STATES.CAMERA:
     case STATES.HD_CAMERA:
       doCapture();
+      break;
+
+    case STATES.ANALYZING:
+    case STATES.HD_ANALYZING:
+      endRequest('cancelled', { by: 'sideClick' });
+      setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
       break;
 
     case STATES.RESULT:
