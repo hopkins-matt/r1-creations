@@ -30,6 +30,9 @@ let state        = STATES.CAMERA;
 let resultPage   = 1;          // 1 = description, 2 = fun fact
 let creditClicks = 0;          // easter egg counter (need 3)
 let errorTimer   = null;
+let llmTimer     = null;
+
+const RESPONSE_TIMEOUT_MS = 20000;
 
 const settings = {
   voice:  false,
@@ -197,28 +200,37 @@ function sendToLLM(imageBase64, prompt) {
   // Re-assign callback right before send (Launch Pad R1 pattern)
   window.onPluginMessage = _onPluginMsg;
 
-  // Use pluginId approach (Magic Kam pattern) — proven to callback
+  // Official SDK flags:
+  // - useLLM: request LLM inference
+  // - wantsJournalEntry: keep this out of Rabbithole journal entries
   var payload = {
-    message:        prompt,
-    pluginId:       'com.r1.pixelart',
-    imageBase64:    imageBase64,
+    message:           prompt,
+    useLLM:            true,
+    wantsR1Response:   !!settings.voice,
+    wantsJournalEntry: false,
   };
+  if (imageBase64) payload.imageBase64 = imageBase64;
   dbg('posting to PMH, msg len=' + prompt.length + ', img len=' + (imageBase64 ? imageBase64.length : 0));
   try {
     PluginMessageHandler.postMessage(JSON.stringify(payload));
     dbg('postMessage sent OK — waiting for onPluginMessage...');
   } catch (e) {
     dbg('postMessage error: ' + e.message);
+    showError('Request failed — try again');
+    setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
+    return;
   }
 
-  // Watchdog: if no response in 15s, log state
-  setTimeout(function() {
+  clearTimeout(llmTimer);
+  llmTimer = setTimeout(function() {
     if (state === STATES.ANALYZING || state === STATES.HD_ANALYZING) {
-      dbg('WATCHDOG: no response after 15s');
+      dbg('WATCHDOG: no response after ' + RESPONSE_TIMEOUT_MS + 'ms');
       dbg('onPluginMessage is: ' + typeof window.onPluginMessage);
       dbg('onPluginMessage === _onPluginMsg: ' + (window.onPluginMessage === _onPluginMsg));
+      showError('No response yet — try again');
+      setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
     }
-  }, 15000);
+  }, RESPONSE_TIMEOUT_MS);
 }
 
 // Register callback — try both assignment styles the R1 might expect
@@ -227,12 +239,11 @@ function _onPluginMsg(data) {
     dbg('onPluginMessage fired, type=' + typeof data);
     if (typeof data === 'string') {
       dbg('data is string, len=' + data.length + ': ' + data.substring(0, 150));
-      handleLLMResponse({ data: data });
-      return;
+    } else {
+      dbg('data keys=' + (data ? Object.keys(data).join(',') : 'null'));
+      dbg('data.data=' + (data && data.data ? String(data.data).substring(0, 150) : 'empty'));
+      dbg('data.message=' + (data && data.message ? String(data.message).substring(0, 150) : 'empty'));
     }
-    dbg('data keys=' + (data ? Object.keys(data).join(',') : 'null'));
-    dbg('data.data=' + (data && data.data ? String(data.data).substring(0, 150) : 'empty'));
-    dbg('data.message=' + (data && data.message ? String(data.message).substring(0, 150) : 'empty'));
     handleLLMResponse(data);
   } catch (e) {
     dbg('onPluginMessage ERROR: ' + e.message);
@@ -267,38 +278,126 @@ try {
 var _origDesc = Object.getOwnPropertyDescriptor(window, 'onPluginMessage');
 dbg('onPluginMessage defined: ' + (typeof window.onPluginMessage) + ', configurable: ' + (_origDesc ? _origDesc.configurable : 'N/A'));
 
-function handleLLMResponse(data) {
-  const raw     = (data && (data.data || data.message)) || '';
-  dbg('raw response len=' + raw.length);
-  const cleaned = raw
+function cleanJSONText(raw) {
+  return String(raw || '')
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
-    .replace(/```\s*$/, '')
+    .replace(/```\s*$/i, '')
     .trim();
+}
 
-  let parsed = null;
+function tryParseJSON(raw) {
+  if (typeof raw !== 'string') return null;
+  const cleaned = cleanJSONText(raw);
+  if (!cleaned) return null;
+
   try {
-    parsed = JSON.parse(cleaned);
+    return JSON.parse(cleaned);
   } catch (e) {
-    // JSON parse failed — try to salvage for hot dog mode via string check
-    if (state === STATES.HD_ANALYZING) {
-      const upper = raw.toUpperCase();
-      parsed = {
-        result: upper.includes('NOT HOT DOG') ? 'NOT HOT DOG' : upper.includes('HOT DOG') ? 'HOT DOG' : 'NOT HOT DOG',
-        reason: raw.length < 200 ? raw : 'Unable to classify.',
-      };
-    } else {
-      showError('Could not read response — try again');
-      setState(state === STATES.ANALYZING ? STATES.CAMERA : STATES.HD_CAMERA);
-      return;
+    // Fall through to extract-first-object parsing
+  }
+
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start !== -1 && end > start) {
+    try {
+      return JSON.parse(cleaned.slice(start, end + 1));
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
+}
+
+function isResultPayload(value) {
+  return !!value && typeof value === 'object' && (
+    typeof value.name === 'string' ||
+    typeof value.category === 'string' ||
+    typeof value.description === 'string' ||
+    typeof value.fun_fact === 'string' ||
+    typeof value.reason === 'string' ||
+    typeof value.result === 'string'
+  );
+}
+
+function extractPlainText(value, depth) {
+  if (depth > 5 || value == null) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value !== 'object') return '';
+
+  const keys = ['data', 'message', 'response', 'output', 'content', 'text'];
+  for (const key of keys) {
+    if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
+  }
+  for (const key of keys) {
+    if (value[key] && typeof value[key] === 'object') {
+      const nested = extractPlainText(value[key], depth + 1);
+      if (nested) return nested;
+    }
+  }
+  return '';
+}
+
+function extractResultPayload(value, depth) {
+  if (depth > 5 || value == null) return null;
+
+  if (typeof value === 'string') {
+    const parsedString = tryParseJSON(value);
+    return parsedString ? extractResultPayload(parsedString, depth + 1) : null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = extractResultPayload(item, depth + 1);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  if (typeof value !== 'object') return null;
+  if (isResultPayload(value)) return value;
+
+  const wrapperKeys = ['data', 'message', 'response', 'payload', 'result', 'output', 'content', 'text'];
+  for (const key of wrapperKeys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      const nested = extractResultPayload(value[key], depth + 1);
+      if (nested) return nested;
     }
   }
 
-  if (state === STATES.HD_ANALYZING) {
-    showHotdogResult(parsed);
-  } else {
-    showResult(parsed);
+  return null;
+}
+
+function handleLLMResponse(data) {
+  // Only process responses while actively waiting on the LLM.
+  if (state !== STATES.ANALYZING && state !== STATES.HD_ANALYZING) {
+    dbg('ignoring plugin message while state=' + state);
+    return;
   }
+
+  let parsed = extractResultPayload(data, 0);
+  if (!parsed && state === STATES.HD_ANALYZING) {
+    const fallbackText = extractPlainText(data, 0);
+    const upper = fallbackText.toUpperCase();
+    if (upper.includes('HOT DOG')) {
+      parsed = {
+        result: upper.includes('NOT HOT DOG') ? 'NOT HOT DOG' : 'HOT DOG',
+        reason: fallbackText.length <= 200 ? fallbackText : 'Unable to classify.',
+      };
+    }
+  }
+
+  if (!parsed) {
+    dbg('ignored plugin message (no parseable result payload)');
+    return;
+  }
+
+  clearTimeout(llmTimer);
+  llmTimer = null;
+
+  dbg('parsed response keys=' + Object.keys(parsed).join(','));
+  if (state === STATES.HD_ANALYZING || typeof parsed.result === 'string') showHotdogResult(parsed);
+  else showResult(parsed);
 }
 
 // ═══════════════════════════════════════════
@@ -371,6 +470,11 @@ function showResultPage(page) {
 
 function setState(newState) {
   state = newState;
+
+  if (newState !== STATES.ANALYZING && newState !== STATES.HD_ANALYZING) {
+    clearTimeout(llmTimer);
+    llmTimer = null;
+  }
 
   // Deactivate all screens
   Object.values(screens).forEach(s => s.classList.remove('active'));
