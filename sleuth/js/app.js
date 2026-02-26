@@ -31,8 +31,11 @@ let resultPage   = 1;          // 1 = description, 2 = fun fact
 let creditClicks = 0;          // easter egg counter (need 3)
 let errorTimer   = null;
 let llmTimer     = null;
+let activeRequest = null;
+let debugCounter = 0;
 
 const RESPONSE_TIMEOUT_MS = 20000;
+const DEBUG_MAX_LINES = 120;
 
 const settings = {
   voice:  false,
@@ -80,6 +83,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   bindHardwareEvents();
   startCamera();
   addErrorToast();
+  dbgSnapshot('dom-ready');
 
   // R1 WebView may block autoplay — retry video.play() on first user interaction
   function resumeVideo() {
@@ -101,11 +105,70 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ═══════════════════════════════════════════
 
 function dbg(msg) {
-  console.log('[sleuth] ' + msg);
+  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const line = '[' + ts + ' #' + (++debugCounter) + ' ' + state + '] ' + msg;
+  console.log('[sleuth] ' + line);
   // Temporary on-screen debug — remove before release
   var d = document.getElementById('dbg');
   if (!d) { d = document.createElement('div'); d.id = 'dbg'; d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#000;color:#0f0;font:9px monospace;padding:4px;z-index:9999;max-height:80px;overflow-y:auto;'; document.body.appendChild(d); }
-  d.textContent += msg + '\n';
+  const lines = d.textContent ? d.textContent.split('\n').filter(Boolean) : [];
+  lines.push(line);
+  if (lines.length > DEBUG_MAX_LINES) lines.splice(0, lines.length - DEBUG_MAX_LINES);
+  d.textContent = lines.join('\n') + '\n';
+  d.scrollTop = d.scrollHeight;
+}
+
+function dbgJson(prefix, data) {
+  try {
+    dbg(prefix + ' ' + JSON.stringify(data));
+  } catch (e) {
+    dbg(prefix + ' [unserializable]');
+  }
+}
+
+function dbgSnapshot(reason) {
+  dbgJson('snapshot/' + reason, {
+    state: state,
+    resultPage: resultPage,
+    voice: settings.voice,
+    hotdog: settings.hotdog,
+    waitingForLLM: !!llmTimer,
+    activeRequestId: activeRequest ? activeRequest.id : null,
+    videoReady: !!(video && video.videoWidth),
+    videoSize: video ? (video.videoWidth + 'x' + video.videoHeight) : 'n/a',
+  });
+}
+
+function beginRequest(prompt, imageBase64) {
+  const mode = state === STATES.HD_ANALYZING ? 'hotdog' : 'standard';
+  activeRequest = {
+    id: 'req_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1000),
+    mode: mode,
+    startedAt: Date.now(),
+    promptLen: prompt ? prompt.length : 0,
+    imageLen: imageBase64 ? imageBase64.length : 0,
+    wantsR1Response: !!settings.voice,
+  };
+  dbgJson('request/start', {
+    id: activeRequest.id,
+    mode: activeRequest.mode,
+    promptLen: activeRequest.promptLen,
+    imageLen: activeRequest.imageLen,
+    wantsR1Response: activeRequest.wantsR1Response,
+  });
+  return activeRequest.id;
+}
+
+function endRequest(status, details) {
+  const req = activeRequest;
+  const durationMs = req ? (Date.now() - req.startedAt) : null;
+  dbgJson('request/' + status, {
+    id: req ? req.id : null,
+    mode: req ? req.mode : null,
+    durationMs: durationMs,
+    details: details || {},
+  });
+  activeRequest = null;
 }
 
 async function startCamera() {
@@ -184,6 +247,7 @@ function captureFrame() {
 function sendToLLM(imageBase64, prompt) {
   dbg('sendToLLM called, PMH=' + (typeof PluginMessageHandler));
   dbg('imageBase64 len=' + (imageBase64 ? imageBase64.length : 0));
+  beginRequest(prompt, imageBase64);
 
   if (typeof PluginMessageHandler === 'undefined') {
     // Dev mode — simulate a response after a short delay
@@ -210,12 +274,20 @@ function sendToLLM(imageBase64, prompt) {
     wantsJournalEntry: false,
   };
   if (imageBase64) payload.imageBase64 = imageBase64;
-  dbg('posting to PMH, msg len=' + prompt.length + ', img len=' + (imageBase64 ? imageBase64.length : 0));
+  dbgJson('request/payload-meta', {
+    id: activeRequest ? activeRequest.id : null,
+    promptLen: prompt.length,
+    imageLen: imageBase64 ? imageBase64.length : 0,
+    useLLM: payload.useLLM,
+    wantsR1Response: payload.wantsR1Response,
+    wantsJournalEntry: payload.wantsJournalEntry,
+  });
   try {
     PluginMessageHandler.postMessage(JSON.stringify(payload));
     dbg('postMessage sent OK — waiting for onPluginMessage...');
   } catch (e) {
     dbg('postMessage error: ' + e.message);
+    endRequest('post-error', { error: e.message });
     showError('Request failed — try again');
     setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
     return;
@@ -227,6 +299,8 @@ function sendToLLM(imageBase64, prompt) {
       dbg('WATCHDOG: no response after ' + RESPONSE_TIMEOUT_MS + 'ms');
       dbg('onPluginMessage is: ' + typeof window.onPluginMessage);
       dbg('onPluginMessage === _onPluginMsg: ' + (window.onPluginMessage === _onPluginMsg));
+      endRequest('timeout', { timeoutMs: RESPONSE_TIMEOUT_MS });
+      dbgSnapshot('timeout');
       showError('No response yet — try again');
       setState(state === STATES.HD_ANALYZING ? STATES.HD_CAMERA : STATES.CAMERA);
     }
@@ -236,7 +310,7 @@ function sendToLLM(imageBase64, prompt) {
 // Register callback — try both assignment styles the R1 might expect
 function _onPluginMsg(data) {
   try {
-    dbg('onPluginMessage fired, type=' + typeof data);
+    dbg('onPluginMessage fired, type=' + typeof data + ', activeRequest=' + (activeRequest ? activeRequest.id : 'none'));
     if (typeof data === 'string') {
       dbg('data is string, len=' + data.length + ': ' + data.substring(0, 150));
     } else {
@@ -368,36 +442,104 @@ function extractResultPayload(value, depth) {
   return null;
 }
 
+function normalizeStandardPayload(value) {
+  if (!value || typeof value !== 'object') return null;
+
+  const name = value.name || value.object || value.item || value.title || '';
+  const category = value.category || value.type || '';
+  const description = value.description || value.summary || value.details || value.reason || '';
+  const fact = value.fun_fact || value.fact || value.trivia || '';
+
+  if (name || category || description || fact) {
+    return {
+      name: String(name || 'Unknown'),
+      category: String(category || ''),
+      description: String(description || ''),
+      fun_fact: String(fact || ''),
+    };
+  }
+
+  return null;
+}
+
+function buildFallbackStandardPayload(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return null;
+
+  const parsed = tryParseJSON(text);
+  const normalized = normalizeStandardPayload(parsed);
+  if (normalized) return normalized;
+
+  return {
+    name: 'Unknown',
+    category: '',
+    description: text,
+    fun_fact: '',
+  };
+}
+
 function handleLLMResponse(data) {
   // Only process responses while actively waiting on the LLM.
   if (state !== STATES.ANALYZING && state !== STATES.HD_ANALYZING) {
-    dbg('ignoring plugin message while state=' + state);
+    dbg('ignoring plugin message while state=' + state + ', activeRequest=' + (activeRequest ? activeRequest.id : 'none'));
     return;
   }
 
   let parsed = extractResultPayload(data, 0);
+  const fallbackText = extractPlainText(data, 0);
+  let parseSource = parsed ? 'structured' : 'none';
+
   if (!parsed && state === STATES.HD_ANALYZING) {
-    const fallbackText = extractPlainText(data, 0);
     const upper = fallbackText.toUpperCase();
     if (upper.includes('HOT DOG')) {
       parsed = {
         result: upper.includes('NOT HOT DOG') ? 'NOT HOT DOG' : 'HOT DOG',
         reason: fallbackText.length <= 200 ? fallbackText : 'Unable to classify.',
       };
+      parseSource = 'hotdog-text-fallback';
     }
+  }
+  if (!parsed && state === STATES.ANALYZING) {
+    parsed = buildFallbackStandardPayload(fallbackText);
+    if (parsed) parseSource = 'standard-text-fallback';
   }
 
   if (!parsed) {
-    dbg('ignored plugin message (no parseable result payload)');
+    dbgJson('response/ignored', {
+      reason: 'no-parseable-payload',
+      fallbackTextLen: fallbackText.length,
+      activeRequestId: activeRequest ? activeRequest.id : null,
+    });
     return;
   }
 
   clearTimeout(llmTimer);
   llmTimer = null;
 
-  dbg('parsed response keys=' + Object.keys(parsed).join(','));
-  if (state === STATES.HD_ANALYZING || typeof parsed.result === 'string') showHotdogResult(parsed);
-  else showResult(parsed);
+  // Coerce standard payloads to the fields the UI expects.
+  if (state === STATES.ANALYZING && typeof parsed.result !== 'string') {
+    parsed = normalizeStandardPayload(parsed) || buildFallbackStandardPayload(fallbackText);
+  }
+
+  dbgJson('response/parsed', {
+    source: parseSource,
+    keys: Object.keys(parsed || {}),
+    activeRequestId: activeRequest ? activeRequest.id : null,
+  });
+  if (!parsed) {
+    endRequest('parse-error', { reason: 'normalized-null' });
+    showError('Could not read response — try again');
+    setState(STATES.CAMERA);
+    return;
+  }
+
+  if (state === STATES.HD_ANALYZING || typeof parsed.result === 'string') {
+    endRequest('success', { ui: 'hotdog-result' });
+    showHotdogResult(parsed);
+  } else {
+    endRequest('success', { ui: 'standard-result' });
+    showResult(parsed);
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -405,16 +547,19 @@ function handleLLMResponse(data) {
 // ═══════════════════════════════════════════
 
 function doCapture() {
+  dbg('capture/start from state=' + state);
   const isHotdog = state === STATES.HD_CAMERA;
   const nextState = isHotdog ? STATES.HD_ANALYZING : STATES.ANALYZING;
   setState(nextState);
 
   const imageBase64 = captureFrame();
   if (!imageBase64) {
+    dbg('capture/failed video not ready');
     showError('Camera not ready — try again');
     setState(isHotdog ? STATES.HD_CAMERA : STATES.CAMERA);
     return;
   }
+  dbg('capture/ok img len=' + imageBase64.length);
 
   sendToLLM(imageBase64, isHotdog ? PROMPT_HOTDOG : PROMPT_STANDARD);
 }
@@ -436,6 +581,12 @@ function showResult(parsed) {
 
   // Hide category pill if empty
   $('result-category').style.display = category ? 'inline-block' : 'none';
+  dbgJson('ui/show-result', {
+    nameLen: String(name).length,
+    categoryLen: String(category).length,
+    descLen: String(desc).length,
+    factLen: String(fact).length,
+  });
 
   resultPage = 1;
   showResultPage(1);
@@ -449,6 +600,10 @@ function showHotdogResult(parsed) {
   $('hd-icon').textContent   = isHotDog ? '🌭' : '🚫';
   $('hd-verdict').textContent = isHotDog ? 'HOT DOG' : 'NOT HOT DOG';
   $('hd-reason').textContent  = parsed.reason || '';
+  dbgJson('ui/show-hotdog-result', {
+    verdict: $('hd-verdict').textContent,
+    reasonLen: String(parsed.reason || '').length,
+  });
 
   // Border color via R1 API
   if (typeof updateAppBorderColor !== 'undefined') {
@@ -469,12 +624,14 @@ function showResultPage(page) {
 // ═══════════════════════════════════════════
 
 function setState(newState) {
+  const prevState = state;
   state = newState;
 
   if (newState !== STATES.ANALYZING && newState !== STATES.HD_ANALYZING) {
     clearTimeout(llmTimer);
     llmTimer = null;
   }
+  dbg('state ' + prevState + ' -> ' + newState);
 
   // Deactivate all screens
   Object.values(screens).forEach(s => s.classList.remove('active'));
@@ -534,6 +691,7 @@ function bindHardwareEvents() {
 }
 
 function onSideClick() {
+  dbg('event/sideClick state=' + state);
   switch (state) {
     case STATES.CAMERA:
     case STATES.HD_CAMERA:
@@ -558,6 +716,7 @@ function onSideClick() {
 }
 
 function onLongPress() {
+  dbg('event/longPressEnd state=' + state);
   switch (state) {
     case STATES.RESULT:
     case STATES.HD_RESULT:
@@ -571,6 +730,7 @@ function onLongPress() {
 }
 
 function onScrollUp() {
+  dbg('event/scrollUp state=' + state + ' page=' + resultPage);
   switch (state) {
     case STATES.RESULT:
       if (resultPage === 2) showResultPage(1);
@@ -579,6 +739,7 @@ function onScrollUp() {
 }
 
 function onScrollDown() {
+  dbg('event/scrollDown state=' + state + ' page=' + resultPage);
   switch (state) {
     case STATES.RESULT:
       if (resultPage === 1) {
@@ -591,6 +752,7 @@ function onScrollDown() {
 }
 
 function returnToCamera() {
+  dbg('ui/returnToCamera hotdog=' + settings.hotdog);
   setState(settings.hotdog ? STATES.HD_CAMERA : STATES.CAMERA);
 }
 
@@ -655,6 +817,7 @@ function bindUIEvents() {
 }
 
 function closeSettings() {
+  dbg('ui/closeSettings');
   // Return to whichever camera mode is active
   setState(settings.hotdog ? STATES.HD_CAMERA : STATES.CAMERA);
 }
@@ -663,6 +826,7 @@ function updateToggleUI(id, isOn) {
   const btn = $(id);
   btn.textContent     = isOn ? 'ON' : 'OFF';
   btn.dataset.on      = isOn ? 'true' : 'false';
+  dbg('ui/toggle ' + id + '=' + isOn);
 }
 
 // ═══════════════════════════════════════════
@@ -683,6 +847,7 @@ async function loadSettings() {
     }
   } catch (e) {
     // Storage unavailable or corrupt — use defaults
+    dbg('storage/load error: ' + e.message);
   }
 
   // Apply loaded settings to UI
@@ -693,6 +858,7 @@ async function loadSettings() {
   if (settings.hotdog) {
     $('hotdog-row').hidden = false;
   }
+  dbgSnapshot('settings-loaded');
 }
 
 async function saveSettings() {
@@ -703,9 +869,10 @@ async function saveSettings() {
         hotdog: settings.hotdog,
       }));
       await window.creationStorage.plain.setItem(STORAGE_KEY, payload);
+      dbgJson('storage/saved', { key: STORAGE_KEY, voice: settings.voice, hotdog: settings.hotdog });
     }
   } catch (e) {
-    // Fail silently
+    dbg('storage/save error: ' + e.message);
   }
 }
 
@@ -724,6 +891,7 @@ function showError(msg) {
   if (!toast) return;
   toast.textContent = msg;
   toast.classList.add('show');
+  dbg('error/toast ' + msg);
   clearTimeout(errorTimer);
   errorTimer = setTimeout(() => toast.classList.remove('show'), 3000);
 }
